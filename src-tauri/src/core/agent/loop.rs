@@ -201,6 +201,7 @@ impl ModelInvoker for HttpModelInvoker {
                 converter.as_ref(),
                 &normalized,
                 events,
+                self.retry,
             )
             .await
         } else {

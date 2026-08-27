@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use reqwest::Client;
 use rmcp::model::{CallToolRequestParam, CallToolResult};
@@ -1054,6 +1055,7 @@ pub(crate) async fn stream_converted_chat_completions(
     converter: &dyn UpstreamConverter,
     body: &serde_json::Value,
     events: &mpsc::UnboundedSender<StreamEvent>,
+    retry: super::genai_bridge::RetryConfig,
 ) -> Result<serde_json::Value, String> {
     // Base is upstream_url minus the trailing "/chat/completions". Recover it
     // the same way the proxy does when it swaps the destination path.
@@ -1078,81 +1080,194 @@ pub(crate) async fn stream_converted_chat_completions(
         api_keys.iter().map(|s| Some(s.as_str())).collect()
     };
 
-    let mut last_err = String::new();
-    for (i, key_ref) in attempts.iter().enumerate() {
-        let mut req = client
-            .post(&native_url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "text/event-stream")
-            .header("Accept-Encoding", "identity");
+    let mut spent = Duration::ZERO;
+    let mut last_err = String::from("Upstream request failed");
+    let max_attempts = retry.max_attempts.max(1);
+    let base_backoff = Duration::from_millis(retry.backoff_ms);
 
-        // The converter decides the auth scheme (Bearer default, but Google
-        // uses x-goog-api-key and Anthropic x-api-key).
-        if let Some(key) = key_ref {
-            let (auth_name, auth_value) = converter.auth_header(key);
-            req = req.header(auth_name, auth_value);
-            for (name, value) in converter.credential_headers(key) {
+    for (i, key_ref) in attempts.iter().enumerate() {
+        for attempt in 0..max_attempts {
+            // Nothing has reached the consumer for *this* attempt yet. Set as
+            // soon as the stream commits anything; once true, this turn can
+            // never be resent.
+            let mut progressed = false;
+            let mut req = client
+                .post(&native_url)
+                .header("Content-Type", "application/json")
+                .header("Accept", "text/event-stream")
+                .header("Accept-Encoding", "identity");
+
+            // The converter decides the auth scheme (Bearer default, but Google
+            // uses x-goog-api-key and Anthropic x-api-key).
+            if let Some(key) = key_ref {
+                let (auth_name, auth_value) = converter.auth_header(key);
+                req = req.header(auth_name, auth_value);
+                for (name, value) in converter.credential_headers(key) {
+                    req = req.header(name, value);
+                }
+            }
+            // Fixed headers the native API requires (Anthropic: anthropic-version).
+            for (name, value) in converter.extra_headers() {
                 req = req.header(name, value);
             }
-        }
-        // Fixed headers the native API requires (Anthropic: anthropic-version).
-        for (name, value) in converter.extra_headers() {
-            req = req.header(name, value);
-        }
 
-        let resp = req
-            .body(native_body.to_string())
-            .send()
-            .await
-            .map_err(|e| format!("Upstream request failed: {e}"))?;
+            let resp = match req.body(native_body.to_string()).send().await {
+                Ok(r) => r,
+                // No response at all: connect failure or timeout. Nothing was
+                // received, so another attempt cannot duplicate anything.
+                Err(e) => {
+                    last_err = format!("Upstream request failed: {e}");
+                    super::genai_bridge::wait_before_retry(
+                        events,
+                        attempt,
+                        max_attempts,
+                        base_backoff,
+                        None,
+                        &mut spent,
+                        &last_err,
+                    )
+                    .await?;
+                    continue;
+                }
+            };
 
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            last_err = format!("Upstream returned HTTP {status}: {text}");
-            if is_context_overflow_body(&text) {
-                last_err = format!("[{CONTEXT_OVERFLOW_MARKER}] {last_err}");
+            let status = resp.status();
+            if !status.is_success() {
+                let retry_after = converted_retry_after(resp.headers());
+                let text = resp.text().await.unwrap_or_default();
+                last_err = format!("Upstream returned HTTP {status}: {text}");
+                // A context overflow is the caller's to fix by compacting, not
+                // something a resend can help with.
+                if is_context_overflow_body(&text) {
+                    return Err(format!("[{CONTEXT_OVERFLOW_MARKER}] {last_err}"));
+                }
+                if should_try_next_api_key(status) && i + 1 < attempts.len() {
+                    log::warn!(
+                        "converted stream: HTTP {status} with API key index {i}, trying next key"
+                    );
+                    break;
+                }
+                match super::genai_bridge::disposition_for_status(status.as_u16()) {
+                    super::genai_bridge::Disposition::Fatal => return Err(last_err),
+                    // The key chain is exhausted (the branch above did not
+                    // fire), so waiting on this key is all that is left.
+                    super::genai_bridge::Disposition::NextKey => return Err(last_err),
+                    super::genai_bridge::Disposition::Retry => {
+                        // A 429 with another key available rotates instead of
+                        // waiting: another key usually has its own quota.
+                        if status.as_u16() == 429 && i + 1 < attempts.len() {
+                            break;
+                        }
+                        super::genai_bridge::wait_before_retry(
+                            events,
+                            attempt,
+                            max_attempts,
+                            base_backoff,
+                            retry_after,
+                            &mut spent,
+                            &last_err,
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
             }
-            if should_try_next_api_key(status) && i + 1 < attempts.len() {
-                log::warn!(
-                    "converted stream: HTTP {status} with API key index {i}, trying next key"
-                );
+
+            // Every converted call above requests a stream. Some native backends
+            // (notably ChatGPT Codex) omit Content-Type on a valid SSE response, so
+            // absence means SSE; an explicit non-SSE type remains the JSON fallback.
+            let is_sse = resp
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|ct| ct.contains("event-stream"))
+                .unwrap_or(true);
+
+            let completion = if is_sse {
+                match consume_converted_sse(resp, converter, events, &mut progressed).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // Committed output cannot be replayed, so the error stands.
+                        if progressed || e.contains(CONTEXT_OVERFLOW_MARKER) {
+                            return Err(e);
+                        }
+                        last_err = e;
+                        super::genai_bridge::wait_before_retry(
+                            events,
+                            attempt,
+                            max_attempts,
+                            base_backoff,
+                            None,
+                            &mut spent,
+                            &last_err,
+                        )
+                        .await?;
+                        continue;
+                    }
+                }
+            } else {
+                let bytes = resp
+                    .bytes()
+                    .await
+                    .map_err(|e| format!("Upstream body read failed: {e}"))?;
+                decode_converted_response(&bytes, converter)?
+            };
+
+            // The blank turn: streamed cleanly, carried no answer. Safe to
+            // resend precisely because nothing was handed to the consumer.
+            if !progressed && super::genai_bridge::is_answerless(&completion) {
+                last_err =
+                    String::from("Upstream completed without producing an answer (empty completion)");
+                super::genai_bridge::wait_before_retry(
+                    events,
+                    attempt,
+                    max_attempts,
+                    base_backoff,
+                    None,
+                    &mut spent,
+                    &last_err,
+                )
+                .await?;
                 continue;
             }
-            return Err(last_err);
+
+            return Ok(completion);
         }
-
-        // Every converted call above requests a stream. Some native backends
-        // (notably ChatGPT Codex) omit Content-Type on a valid SSE response, so
-        // absence means SSE; an explicit non-SSE type remains the JSON fallback.
-        let is_sse = resp
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.contains("event-stream"))
-            .unwrap_or(true);
-
-        if is_sse {
-            return consume_converted_sse(resp, converter, events).await;
-        }
-
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| format!("Upstream body read failed: {e}"))?;
-        return decode_converted_response(&bytes, converter);
     }
 
     Err(last_err)
 }
 
+/// `Retry-After` from a native provider's response (reqwest 0.12 header map;
+/// the genai path has its own copy for reqwest 0.13). `retry-after-ms` wins
+/// over `retry-after`; a date-form value is ignored rather than parsed.
+fn converted_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let ms = headers
+        .get("retry-after-ms")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(Duration::from_millis);
+    ms.or_else(|| {
+        headers
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map(Duration::from_secs)
+    })
+}
+
 /// Read a native SSE stream, translating each event through `converter` and
 /// feeding the produced chat-shaped chunks into the OpenAI [`SseAccumulator`]
 /// so `StreamEvent`s match the chat/completions path exactly.
+///
+/// Sets `progressed` as soon as anything reaches the consumer, so the caller
+/// can tell a stream that died before committing anything (safe to resend)
+/// from one that already put output on screen (never resend).
 async fn consume_converted_sse(
     resp: reqwest::Response,
     converter: &dyn UpstreamConverter,
     events: &mpsc::UnboundedSender<StreamEvent>,
+    progressed: &mut bool,
 ) -> Result<serde_json::Value, String> {
     let mut stream = resp.bytes_stream();
     let mut frame = crate::core::server::converters::SseAccumulator::new();
@@ -1160,8 +1275,17 @@ async fn consume_converted_sse(
     // Reassembles the translated chat/completions SSE into one completion.
     let mut acc = SseAccumulator::default();
 
+    let mut read_err = None;
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| format!("Upstream stream error: {e}"))?;
+        let chunk = match chunk {
+            Ok(c) => c,
+            // Report what was already committed before the stream broke: the
+            // caller needs it to decide whether resending is safe.
+            Err(e) => {
+                read_err = Some(format!("Upstream stream error: {e}"));
+                break;
+            }
+        };
         let text = String::from_utf8_lossy(&chunk);
         for event in frame.push(&text) {
             for payload in converter.convert_stream_event(&event, &mut state) {
@@ -1169,11 +1293,17 @@ async fn consume_converted_sse(
                 acc.ingest(&payload, events);
             }
         }
+        *progressed |= acc.progressed;
     }
     if let Some(event) = frame.finish() {
         for payload in converter.convert_stream_event(&event, &mut state) {
             acc.ingest(&payload, events);
         }
+    }
+    *progressed |= acc.progressed;
+
+    if let Some(err) = read_err {
+        return Err(err);
     }
 
     if let Some(err) = acc.error.take() {
@@ -1245,6 +1375,11 @@ struct SseAccumulator {
     /// capturing it the run would end as a silent "no answer" instead of
     /// surfacing the failure. The converted-stream reader turns it into an error.
     error: Option<String>,
+    /// Whether anything has been handed to the consumer yet: prose, reasoning,
+    /// or a tool call. Once true the turn is committed and resending it would
+    /// duplicate what the user already saw, so it is the gate a retry has to
+    /// clear -- the same rule the genai path enforces with its own flag.
+    progressed: bool,
 }
 
 impl SseAccumulator {
@@ -1312,6 +1447,7 @@ impl SseAccumulator {
         if let Some(text) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
             if !text.is_empty() {
                 self.reasoning.push_str(text);
+                self.progressed = true;
                 let _ = events.send(StreamEvent::Reasoning {
                     text: text.to_string(),
                 });
@@ -1321,6 +1457,7 @@ impl SseAccumulator {
         if let Some(text) = delta.get("content").and_then(|v| v.as_str()) {
             if !text.is_empty() {
                 self.content.push_str(text);
+                self.progressed = true;
                 let _ = events.send(StreamEvent::Token {
                     text: text.to_string(),
                 });
@@ -1328,6 +1465,9 @@ impl SseAccumulator {
         }
 
         if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+            // A tool call reaching the consumer commits the turn just as prose
+            // does: it is about to be executed, and side effects do not unwind.
+            self.progressed = true;
             for tc in tcs {
                 let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 while self.tool_calls.len() <= idx {
@@ -1724,8 +1864,12 @@ mod tests {
             let mut bytes = vec![0u8; 16 * 1024];
             let read = socket.read(&mut bytes).await.expect("read");
             bytes.truncate(read);
-            let response = "event: response.completed\n\
-                data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+            // Carries an answer: a contentless completion is now a retryable
+            // blank turn, and this test is about the request contract.
+            let response = "event: response.output_text.delta\n\
+                data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+                event: response.completed\n\
+                data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
             let wire = format!(
                 "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{response}",
                 response.len()
@@ -1752,6 +1896,7 @@ mod tests {
                 "max_tokens": 128,
             }),
             &tx,
+            crate::core::agent::genai_bridge::RetryConfig::default(),
         )
         .await
         .expect("request");
@@ -1767,6 +1912,153 @@ mod tests {
         assert_eq!(body["store"], false);
         assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         assert!(body.get("max_output_tokens").is_none());
+    }
+
+    /// The native-converter path shares the chat/completions blank-turn rule: a
+    /// stream that completes carrying no answer is resent, because nothing was
+    /// handed to the consumer and a resend cannot duplicate anything.
+    #[tokio::test]
+    async fn a_converted_stream_with_no_answer_is_resent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let mut scratch = vec![0u8; 16 * 1024];
+            // First attempt: a clean stream that ends without any output.
+            let (mut first, _) = listener.accept().await.expect("first accept");
+            let _ = first.read(&mut scratch).await;
+            let blank = "event: response.completed\n\
+                data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n";
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{blank}",
+                blank.len()
+            );
+            let _ = first.write_all(wire.as_bytes()).await;
+            let _ = first.flush().await;
+            drop(first);
+
+            // Second attempt: the real answer.
+            let (mut second, _) = listener.accept().await.expect("second accept");
+            let _ = second.read(&mut scratch).await;
+            let good = "event: response.output_text.delta\n\
+                data: {\"type\":\"response.output_text.delta\",\"delta\":\"hi\"}\n\n\
+                event: response.completed\n\
+                data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}}\n\n";
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{good}",
+                good.len()
+            );
+            let _ = second.write_all(wire.as_bytes()).await;
+            let _ = second.flush().await;
+        });
+
+        let converter =
+            crate::core::server::converters::converter_for(Some("openai-responses"), false)
+                .expect("converter");
+        let (tx, mut rx) = sink();
+        let completion = stream_converted_chat_completions(
+            &Client::new(),
+            &format!("http://{addr}/chat/completions"),
+            &[String::from("k")],
+            converter.as_ref(),
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            crate::core::agent::genai_bridge::RetryConfig {
+                max_attempts: 3,
+                backoff_ms: 1,
+            },
+        )
+        .await
+        .expect("the resend carries the turn");
+
+        assert_eq!(
+            completion["choices"][0]["message"]["content"], "hi",
+            "answer from the second attempt: {completion}"
+        );
+        let mut tokens = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::Token { text } = ev {
+                tokens.push(text);
+            }
+        }
+        assert_eq!(tokens, vec!["hi".to_string()], "streamed once, not twice");
+        server.await.expect("server task");
+    }
+
+    /// The gate that must not be gotten wrong: once a tool call has been handed
+    /// to the consumer the turn is committed, and a stream that dies afterwards
+    /// must surface the error rather than replay a call with side effects.
+    #[tokio::test]
+    async fn a_converted_stream_that_already_emitted_a_tool_call_is_never_resent() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = connections.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let mut scratch = vec![0u8; 16 * 1024];
+                let _ = sock.read(&mut scratch).await;
+                // Announce a tool call, promise a longer body, then hang up:
+                // the call is already on its way to execution.
+                let sse = "event: response.output_item.added\n\
+                    data: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"type\":\"function_call\",\"id\":\"c1\",\"call_id\":\"c1\",\"name\":\"bash\"}}\n\n";
+                let wire = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{sse}",
+                    sse.len() + 64
+                );
+                let _ = sock.write_all(wire.as_bytes()).await;
+                let _ = sock.flush().await;
+                drop(sock);
+            }
+        });
+
+        let converter =
+            crate::core::server::converters::converter_for(Some("openai-responses"), false)
+                .expect("converter");
+        let (tx, mut rx) = sink();
+        let result = stream_converted_chat_completions(
+            &Client::new(),
+            &format!("http://{addr}/chat/completions"),
+            &[String::from("k")],
+            converter.as_ref(),
+            &json!({ "model": "m", "messages": [] }),
+            &tx,
+            crate::core::agent::genai_bridge::RetryConfig {
+                max_attempts: 5,
+                backoff_ms: 1,
+            },
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a committed turn surfaces the failure: {result:?}"
+        );
+        let mut started = 0;
+        while let Ok(ev) = rx.try_recv() {
+            if let StreamEvent::ToolCallStarted { .. } = ev {
+                started += 1;
+            }
+        }
+        assert_eq!(started, 1, "the tool call was announced exactly once");
+        assert_eq!(
+            connections.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no resend after the tool call was committed"
+        );
+        server.abort();
     }
 
     /// A proxy in the environment breaks Jan and nothing else, and never shows up

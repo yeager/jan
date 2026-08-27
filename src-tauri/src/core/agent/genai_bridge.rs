@@ -454,7 +454,7 @@ impl RetryConfig {
 /// non-empty array is a real answer; whitespace-only content (" ") is not
 /// blank, those bytes streamed; `finish_reason` "length" is a real (truncated)
 /// answer handled elsewhere; any tool call present is a real answer.
-fn is_answerless(completion: &serde_json::Value) -> bool {
+pub(crate) fn is_answerless(completion: &serde_json::Value) -> bool {
     let choice = completion
         .get("choices")
         .and_then(|c| c.as_array())
@@ -491,7 +491,7 @@ fn is_answerless(completion: &serde_json::Value) -> bool {
 }
 
 /// What to do about a failed attempt.
-enum Disposition {
+pub(crate) enum Disposition {
     /// Retry the same key after a backoff.
     Retry,
     /// The key was rejected; move to the next key in the chain.
@@ -503,7 +503,7 @@ enum Disposition {
 /// HTTP statuses worth another attempt: rate limiting and the transient 5xx
 /// family a load balancer emits while a backend recycles. A 4xx other than 429
 /// is a request the upstream will reject identically forever.
-fn disposition_for_status(status: u16) -> Disposition {
+pub(crate) fn disposition_for_status(status: u16) -> Disposition {
     match status {
         401 | 403 => Disposition::NextKey,
         // 429 can be either: with more keys it's worth rotating, and retrying the
@@ -837,7 +837,7 @@ pub(crate) async fn stream_chat_completions(
 /// The announcement goes out *before* the sleep and travels the same
 /// non-blocking channel as tokens, so the TUI can render "retrying 3/10" while
 /// the wait happens off the draw path (see #8710). `attempt` is 0-based.
-async fn wait_before_retry(
+pub(crate) async fn wait_before_retry(
     events: &mpsc::UnboundedSender<StreamEvent>,
     attempt: u32,
     max_attempts: u32,
