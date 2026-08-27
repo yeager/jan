@@ -722,6 +722,7 @@ pub(crate) async fn call_openai_chat_completions(
     upstream_url: &str,
     api_keys: &[String],
     body: &serde_json::Value,
+    retry: super::genai_bridge::RetryConfig,
 ) -> Result<serde_json::Value, String> {
     let attempts: Vec<Option<&str>> = if api_keys.is_empty() {
         vec![None]
@@ -729,39 +730,97 @@ pub(crate) async fn call_openai_chat_completions(
         api_keys.iter().map(|s| Some(s.as_str())).collect()
     };
 
+    let max_attempts = retry.max_attempts.max(1);
+    let base_backoff = std::time::Duration::from_millis(retry.backoff_ms);
+    let mut spent = std::time::Duration::ZERO;
     let mut last_err = String::new();
     for (i, key_ref) in attempts.iter().enumerate() {
-        let mut req = client
-            .post(upstream_url)
-            .header("Content-Type", "application/json")
-            .header("Accept-Encoding", "identity");
+        for attempt in 0..max_attempts {
+            let mut req = client
+                .post(upstream_url)
+                .header("Content-Type", "application/json")
+                .header("Accept-Encoding", "identity");
 
-        if let Some(key) = key_ref {
-            req = req.header("Authorization", format!("Bearer {key}"));
+            if let Some(key) = key_ref {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
+
+            let resp = match req.body(body.to_string()).send().await {
+                Ok(resp) => resp,
+                // No response at all: connect failure, dropped keep-alive, or
+                // timeout. Nothing was received and this path streams nothing
+                // as it goes, so another attempt cannot duplicate output.
+                Err(e) => {
+                    last_err = format!("Upstream request failed: {}", describe_request_error(&e));
+                    let delay = super::genai_bridge::schedule_retry(
+                        attempt,
+                        max_attempts,
+                        base_backoff,
+                        None,
+                        &mut spent,
+                        &last_err,
+                    )?;
+                    log::warn!(
+                        "upstream: {last_err} -- retrying in {}ms (attempt {}/{max_attempts})",
+                        delay.as_millis(),
+                        attempt + 2
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            let retry_after = converted_retry_after(resp.headers());
+            let text = resp.text().await.map_err(|e| {
+                format!(
+                    "Reading the upstream response failed ({upstream_url}): {}",
+                    describe_request_error(&e)
+                )
+            })?;
+
+            if status.is_success() {
+                return serde_json::from_str::<serde_json::Value>(&text)
+                    .map_err(|e| format!("Failed to parse upstream JSON: {e}. Body: {text}"));
+            }
+
+            last_err = format!("Upstream returned HTTP {status}: {text}");
+            if should_try_next_api_key(status) && i + 1 < attempts.len() {
+                log::warn!(
+                    "OpenAI completion: HTTP {status} with API key index {i}, trying next key"
+                );
+                break;
+            }
+
+            match super::genai_bridge::disposition_for_status(status.as_u16()) {
+                super::genai_bridge::Disposition::Fatal => return Err(last_err),
+                // The key chain is exhausted (the branch above did not fire),
+                // so waiting on this key is all that is left.
+                super::genai_bridge::Disposition::NextKey => return Err(last_err),
+                super::genai_bridge::Disposition::Retry => {
+                    // A 429 with another key available rotates instead of
+                    // waiting: another key usually has its own quota.
+                    if status.as_u16() == 429 && i + 1 < attempts.len() {
+                        break;
+                    }
+                    let delay = super::genai_bridge::schedule_retry(
+                        attempt,
+                        max_attempts,
+                        base_backoff,
+                        retry_after,
+                        &mut spent,
+                        &last_err,
+                    )?;
+                    log::warn!(
+                        "upstream: {last_err} -- retrying in {}ms (attempt {}/{max_attempts})",
+                        delay.as_millis(),
+                        attempt + 2
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+            }
         }
-
-        let resp = send_with_one_retry(req.body(body.to_string())).await?;
-
-        let status = resp.status();
-        let text = resp.text().await.map_err(|e| {
-            format!(
-                "Reading the upstream response failed ({upstream_url}): {}",
-                describe_request_error(&e)
-            )
-        })?;
-
-        if status.is_success() {
-            return serde_json::from_str::<serde_json::Value>(&text)
-                .map_err(|e| format!("Failed to parse upstream JSON: {e}. Body: {text}"));
-        }
-
-        last_err = format!("Upstream returned HTTP {status}: {text}");
-        if should_try_next_api_key(status) && i + 1 < attempts.len() {
-            log::warn!("OpenAI completion: HTTP {status} with API key index {i}, trying next key");
-            continue;
-        }
-
-        return Err(last_err);
     }
 
     Err(last_err)
@@ -846,81 +905,6 @@ fn error_source_chain(err: &dyn std::error::Error) -> Vec<String> {
         cur = e.source();
     }
     chain
-}
-
-/// True when a failed send can be retried safely: the connection died before any
-/// response arrived, so nothing has been streamed to the caller and no side
-/// effect on the upstream is implied. Covers a refused/failed connect and the
-/// stale-keep-alive family -- hyper reports a pooled connection the peer had
-/// already closed as `connection closed before message completed`, or as an
-/// `ECONNRESET`/`EPIPE` io error if the RST lands while the request is going
-/// out. A timeout is deliberately excluded: retrying one doubles the wait.
-#[cfg(not(feature = "cli"))]
-fn is_retryable_send_error(err: &reqwest::Error) -> bool {
-    if err.is_timeout() || err.is_body() || err.is_decode() || err.is_builder() {
-        return false;
-    }
-    err.is_connect() || chain_indicates_dropped_connection(&error_source_chain(err))
-}
-
-/// Whether an error's cause chain names a connection the peer dropped. Matched
-/// on text because the io error is several opaque layers down (hyper's
-/// `SendRequest` -> `connection error` -> `std::io::Error`) and its `ErrorKind`
-/// is not exposed through `reqwest`.
-#[cfg(not(feature = "cli"))]
-fn chain_indicates_dropped_connection(chain: &[String]) -> bool {
-    const MARKERS: &[&str] = &[
-        "connection closed before message completed",
-        "connection reset by peer",
-        "broken pipe",
-        "connection aborted",
-        "unexpected eof",
-    ];
-    chain.iter().any(|msg| {
-        let msg = msg.to_lowercase();
-        MARKERS.iter().any(|m| msg.contains(m))
-    })
-}
-
-/// How long to wait before the one retry of a dropped connection. Long enough
-/// for a load balancer that just recycled a backend to finish, short enough that
-/// the user does not read it as a hang.
-#[cfg(not(feature = "cli"))]
-const SEND_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(250);
-
-/// Send a request, retrying it once when the connection dropped before any
-/// response arrived. This is the failure a long turn invites: while tools run
-/// locally no bytes flow, an idle keep-alive connection is reclaimed by the peer
-/// or its load balancer, and the next turn's request is written into a socket
-/// that is already gone. Retrying is safe precisely because nothing was received
-/// -- see [`is_retryable_send_error`].
-#[cfg(not(feature = "cli"))]
-async fn send_with_one_retry(req: reqwest::RequestBuilder) -> Result<reqwest::Response, String> {
-    // `try_clone` returns `None` only for a streaming body; every caller here
-    // sends a `String`, so the retry path is always available in practice.
-    let retry = req.try_clone();
-    let first = match req.send().await {
-        Ok(resp) => return Ok(resp),
-        Err(e) => e,
-    };
-    let Some(retry) = retry.filter(|_| is_retryable_send_error(&first)) else {
-        return Err(format!(
-            "Upstream request failed: {}",
-            describe_request_error(&first)
-        ));
-    };
-    log::warn!(
-        "upstream: {} -- retrying once",
-        describe_request_error(&first)
-    );
-    tokio::time::sleep(SEND_RETRY_DELAY).await;
-    retry.send().await.map_err(|e| {
-        format!(
-            "Upstream request failed after one retry: {} (first attempt: {})",
-            describe_request_error(&e),
-            describe_request_error(&first)
-        )
-    })
 }
 
 /// The HTTP client every agent turn goes through. Agent traffic now runs on
@@ -1740,54 +1724,93 @@ mod tests {
         );
     }
 
+    /// The desktop's non-streaming inline tool loop goes through
+    /// `call_openai_chat_completions`, which used to give up after one 250ms
+    /// resend and only for a dropped connection. A 429 now waits and resends
+    /// like every other path; it is replay-safe because this path streams
+    /// nothing as it goes -- the completion is returned whole or not at all.
     #[cfg(not(feature = "cli"))]
-    #[test]
-    fn dropped_connection_is_recognised_from_the_cause_chain() {
-        assert!(chain_indicates_dropped_connection(&[
-            "client error (SendRequest)".to_string(),
-            "connection error".to_string(),
-            "Connection reset by peer (os error 104)".to_string(),
-        ]));
-        assert!(chain_indicates_dropped_connection(&[
-            "connection closed before message completed".to_string()
-        ]));
-        assert!(
-            !chain_indicates_dropped_connection(&[
-                "dns error".to_string(),
-                "failed to lookup address information".to_string()
-            ]),
-            "a name that does not resolve is not a dropped connection"
+    #[tokio::test]
+    async fn a_rate_limited_non_streaming_completion_is_retried_and_succeeds() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let server = tokio::spawn(async move {
+            let mut scratch = vec![0u8; 16 * 1024];
+            // First attempt: rate limited, with a Retry-After the client must
+            // not ignore (kept sub-second so the test stays fast).
+            let (mut first, _) = listener.accept().await.expect("first accept");
+            let _ = first.read(&mut scratch).await;
+            let body = "{\"error\":\"slow down\"}";
+            let wire = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nRetry-After-Ms: 5\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = first.write_all(wire.as_bytes()).await;
+            let _ = first.flush().await;
+            drop(first);
+
+            // Second attempt: the real completion.
+            let (mut second, _) = listener.accept().await.expect("second accept");
+            let _ = second.read(&mut scratch).await;
+            let body = "{\"choices\":[{\"message\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}";
+            let wire = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = second.write_all(wire.as_bytes()).await;
+            let _ = second.flush().await;
+        });
+
+        let completion = call_openai_chat_completions(
+            &Client::new(),
+            &format!("http://{addr}/v1/chat/completions"),
+            &[String::from("k")],
+            &json!({ "model": "m", "messages": [] }),
+            crate::core::agent::genai_bridge::RetryConfig {
+                max_attempts: 3,
+                backoff_ms: 1,
+            },
+        )
+        .await
+        .expect("the resend carries the turn");
+
+        assert_eq!(
+            completion["choices"][0]["message"]["content"], "hi",
+            "answer from the second attempt: {completion}"
         );
-        assert!(!chain_indicates_dropped_connection(&[]));
+        server.await.expect("server task");
     }
 
+    /// Exhaustion names the upstream failure rather than returning a blank
+    /// completion the caller would treat as an answer.
     #[cfg(not(feature = "cli"))]
-    /// A refused connect never reached the peer, so retrying it is safe; a
-    /// timeout is excluded on purpose (retrying one doubles the wait).
     #[tokio::test]
-    async fn a_refused_connect_is_retryable_but_a_timeout_is_not() {
-        let refused = Client::new()
-            .post("http://127.0.0.1:1/v1/chat/completions")
-            .body("{}")
-            .send()
-            .await
-            .expect_err("loopback port 1 refuses");
-        assert!(is_retryable_send_error(&refused), "{refused}");
+    async fn a_non_streaming_completion_that_exhausts_retries_names_the_failure() {
+        let err = call_openai_chat_completions(
+            &Client::new(),
+            "http://127.0.0.1:1/v1/chat/completions",
+            &[String::from("k")],
+            &json!({ "model": "m", "messages": [] }),
+            crate::core::agent::genai_bridge::RetryConfig {
+                max_attempts: 3,
+                backoff_ms: 1,
+            },
+        )
+        .await
+        .expect_err("loopback port 1 refuses every attempt");
 
-        // 10.255.255.1 is a reserved address that black-holes rather than
-        // refusing, so the connect attempt hits the timeout instead.
-        let timed_out = Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(50))
-            .build()
-            .expect("client")
-            .post("http://10.255.255.1:81/v1/chat/completions")
-            .body("{}")
-            .send()
-            .await
-            .expect_err("black-holed address times out");
-        if timed_out.is_timeout() {
-            assert!(!is_retryable_send_error(&timed_out), "{timed_out}");
-        }
+        assert!(
+            err.contains("Upstream request failed"),
+            "names the upstream failure: {err}"
+        );
+        assert!(
+            err.contains("attempts") || err.contains("budget"),
+            "says why it stopped: {err}"
+        );
     }
 
     /// The failure a long turn invites: the peer reclaims a keep-alive

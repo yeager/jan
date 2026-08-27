@@ -1367,6 +1367,7 @@ async fn proxy_request(
                     &upstream_url,
                     &session_api_keys,
                     &request_value,
+                    crate::core::agent::genai_bridge::RetryConfig::default(),
                 )
                 .await
                 {

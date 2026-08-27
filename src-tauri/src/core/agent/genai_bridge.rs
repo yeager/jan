@@ -846,14 +846,7 @@ pub(crate) async fn wait_before_retry(
     spent: &mut Duration,
     last_err: &str,
 ) -> Result<(), String> {
-    if attempt + 1 >= max_attempts {
-        return Err(format!("{last_err} (after {max_attempts} attempts)"));
-    }
-    let delay = next_delay(attempt, base, provider);
-    let Some(delay) = budgeted(delay, *spent) else {
-        return Err(format!("{last_err} (retry budget exhausted)"));
-    };
-    *spent += delay;
+    let delay = schedule_retry(attempt, max_attempts, base, provider, spent, last_err)?;
     let _ = events.send(StreamEvent::Retrying {
         attempt: attempt + 1,
         max: max_attempts,
@@ -867,6 +860,35 @@ pub(crate) async fn wait_before_retry(
     );
     tokio::time::sleep(delay).await;
     Ok(())
+}
+
+/// Decide whether another attempt is allowed and how long it must wait, then
+/// charge that wait to the budget. Neither sleeps nor announces: surfaces
+/// disagree on how a retry is shown -- the agent loop streams a `Retrying`
+/// event so the TUI can render "retrying 3/10", while the desktop's
+/// non-streaming proxy handler has no channel to announce on -- but they must
+/// agree on the schedule, so the schedule lives here and only the
+/// announcement differs.
+///
+/// `Err` names the upstream failure behind the exhaustion, so a retry that
+/// runs out is never a silent empty turn.
+pub(crate) fn schedule_retry(
+    attempt: u32,
+    max_attempts: u32,
+    base: Duration,
+    provider: Option<Duration>,
+    spent: &mut Duration,
+    last_err: &str,
+) -> Result<Duration, String> {
+    if attempt + 1 >= max_attempts {
+        return Err(format!("{last_err} (after {max_attempts} attempts)"));
+    }
+    let delay = next_delay(attempt, base, provider);
+    let Some(delay) = budgeted(delay, *spent) else {
+        return Err(format!("{last_err} (retry budget exhausted)"));
+    };
+    *spent += delay;
+    Ok(delay)
 }
 
 /// Exponential backoff for `attempt` (0-based), starting from `base` and capped
