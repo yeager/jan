@@ -9726,6 +9726,20 @@ const AGENT_SETTINGS: &[AgentSettingDef] = &[
         scope: SettingScope::Project,
     },
     AgentSettingDef {
+        key: "max_retries",
+        label: "max_retries",
+        desc: "retries per upstream completion (0 disables retry)",
+        kind: AgentSettingKind::Int { default: Some(10), min: 0 },
+        scope: SettingScope::Project,
+    },
+    AgentSettingDef {
+        key: "retry_backoff_ms",
+        label: "retry_backoff_ms",
+        desc: "first backoff before a retry, in milliseconds",
+        kind: AgentSettingKind::Int { default: Some(250), min: 0 },
+        scope: SettingScope::Project,
+    },
+    AgentSettingDef {
         key: "instructions_file",
         label: "instructions_file",
         desc: "markdown injected into the system prompt",
@@ -16000,6 +16014,40 @@ mod tests {
             n.chars().count() <= 46,
             "table overflows the narrow frame: {n:?}"
         );
+    }
+
+    /// An invisible retry is indistinguishable from a hang (#8710), so the
+    /// attempt has to reach the rendered screen, not just the event stream.
+    #[test]
+    fn a_retry_announces_the_attempt_on_screen() {
+        let mut app = test_app();
+        app.apply(StreamEvent::Token {
+            text: "partial".into(),
+        });
+        app.apply(StreamEvent::Retrying {
+            attempt: 3,
+            max: 11,
+            delay_ms: 500,
+            reason: "Upstream returned HTTP 429: rate limited".into(),
+        });
+        let rows = render_rows(&mut app, 100, 24);
+        let line = rows
+            .iter()
+            .find(|r| r.contains("retrying"))
+            .unwrap_or_else(|| panic!("no retry line on screen: {rows:#?}"));
+        assert!(
+            line.contains("retrying 3/11 in 500ms"),
+            "attempt and wait are not both legible: {line:?}"
+        );
+        assert!(
+            line.contains("429"),
+            "the retry does not say what went wrong: {line:?}"
+        );
+        // The in-flight prose is committed first, so the note never lands
+        // inside a half-drawn assistant row.
+        let retry_at = rows.iter().position(|r| r.contains("retrying")).expect("retry row");
+        let prose_at = rows.iter().position(|r| r.contains("partial")).expect("prose row");
+        assert!(prose_at < retry_at, "the retry note interleaved with the prose");
     }
 
     /// The boxed diff panel is re-drawn at the current width, so its right
