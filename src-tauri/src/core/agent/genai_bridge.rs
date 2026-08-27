@@ -379,16 +379,116 @@ fn chat_request_from_body(body: &serde_json::Value) -> Result<(String, ChatReque
     Ok((model, req))
 }
 
-/// Attempts per API key, per the "10 retries with increasing backoff" policy.
-const MAX_ATTEMPTS: u32 = 10;
-/// First backoff; doubles per attempt up to [`MAX_RETRY_DELAY`].
-const BASE_RETRY_DELAY: Duration = Duration::from_millis(250);
+
+/// Retries after the first failure when `[agent].max_retries` is unset, so 10
+/// here means up to 11 requests. High enough to ride out a provider's
+/// rate-limit window or a load balancer recycling a backend; the run stays
+/// interruptible throughout, so the ceiling is not a commitment to wait.
+pub(crate) const DEFAULT_MAX_RETRIES: u32 = 10;
+/// Default first backoff when `[agent].retry_backoff_ms` is unset; doubles per
+/// attempt up to [`MAX_RETRY_DELAY`].
+pub(crate) const DEFAULT_RETRY_BACKOFF_MS: u64 = 250;
 /// Backoff ceiling. Unbounded doubling over 10 attempts would idle for ~4
 /// minutes, which a user reads as a hang rather than a retry.
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(8);
 /// Total time that may be spent *waiting* between attempts. Bounds the worst
 /// case regardless of attempt count or a hostile `Retry-After`.
 const RETRY_BUDGET: Duration = Duration::from_secs(45);
+
+/// How many times to attempt one completion and how long to back off. Both
+/// come from `agent.toml`, resolved once per run and snapshotted on
+/// `OrchestrationArgs` (like `max_parallel_subagents`), so a mid-run edit
+/// affects the next run only. Copy, cheap to thread by value through the
+/// invoker chain.
+///
+/// Note the vocabulary change at this boundary: the user-facing
+/// `[agent].max_retries` counts attempts *after* the first failure, while this
+/// struct carries the total attempt budget. The `+ 1` conversion happens once,
+/// where the config is resolved, so the engine only ever reasons about totals.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RetryConfig {
+    /// Total attempts allowed for a completion, including the first. `1` is a
+    /// single request with no retry (what `max_retries = 0` resolves to); `0`
+    /// is clamped to the same thing rather than meaning "never send".
+    pub max_attempts: u32,
+    /// First backoff in milliseconds; doubles per attempt up to
+    /// [`MAX_RETRY_DELAY`].
+    pub backoff_ms: u64,
+}
+
+impl Default for RetryConfig {
+    /// Both keys unset. Every non-CLI surface (desktop, proxy) lands here,
+    /// since only the CLI reads `agent.toml`.
+    fn default() -> Self {
+        Self::from_settings(None, None)
+    }
+}
+
+impl RetryConfig {
+    /// Build from the raw `[agent]` keys, absent meaning "use the default".
+    ///
+    /// This is the one place the two vocabularies meet: `max_retries` counts
+    /// attempts after the first failure, so the budget is one greater. An
+    /// explicit `0` is preserved as a real setting -- one request, no retry --
+    /// rather than collapsing into the unset default.
+    pub(crate) fn from_settings(max_retries: Option<u32>, backoff_ms: Option<u64>) -> Self {
+        Self {
+            max_attempts: max_retries
+                .unwrap_or(DEFAULT_MAX_RETRIES)
+                .saturating_add(1),
+            backoff_ms: backoff_ms.unwrap_or(DEFAULT_RETRY_BACKOFF_MS),
+        }
+    }
+}
+
+/// Whether a successfully-streamed completion carries no answer at all.
+///
+/// A provider that reports `finish_reason: "stop"` (or omits it) having
+/// emitted neither text, a reasoning block, nor a tool call leaves the user
+/// with an empty turn they must retype. Such a completion is treated as a
+/// retryable failure -- and that is replay-safe, because an answerless stream
+/// handed nothing to the consumer (`progressed` stays false).
+///
+/// `content` may be a JSON string, null, absent, or a content-part array. Only
+/// a missing/null/empty-string content or an EMPTY array counts as blank. A
+/// non-empty array is a real answer; whitespace-only content (" ") is not
+/// blank, those bytes streamed; `finish_reason` "length" is a real (truncated)
+/// answer handled elsewhere; any tool call present is a real answer.
+fn is_answerless(completion: &serde_json::Value) -> bool {
+    let choice = completion
+        .get("choices")
+        .and_then(|c| c.as_array())
+        .and_then(|c| c.first());
+    let message = choice.and_then(|c| c.get("message"));
+
+    // Any tool call means the turn produced real model output -- not blank.
+    if let Some(tc) = message.and_then(|m| m.get("tool_calls")) {
+        if tc.as_array().is_some_and(|a| !a.is_empty()) {
+            return false;
+        }
+    }
+
+    // `finish_reason` "length" is a real (truncated) answer, handled by the
+    // loop as truncation, not as a blank turn to retry.
+    if choice
+        .and_then(|c| c.get("finish_reason"))
+        .and_then(|v| v.as_str())
+        == Some("length")
+    {
+        return false;
+    }
+
+    // Blank only when content is absent, null, an empty string, or an EMPTY
+    // array. Whitespace-only bytes streamed, so they are a real (if odd)
+    // answer; a non-empty array is a real answer too.
+    match message.and_then(|m| m.get("content")) {
+        None => true,
+        Some(serde_json::Value::Null) => true,
+        Some(serde_json::Value::String(s)) => s.is_empty(),
+        Some(serde_json::Value::Array(a)) => a.is_empty(),
+        Some(_) => true,
+    }
+}
 
 /// What to do about a failed attempt.
 enum Disposition {
@@ -594,6 +694,7 @@ pub(crate) async fn stream_chat_completions(
     api_type: Option<&str>,
     body: &serde_json::Value,
     events: &mpsc::UnboundedSender<StreamEvent>,
+    retry: RetryConfig,
 ) -> Result<serde_json::Value, String> {
     let (model, chat_req) = chat_request_from_body(body)?;
     let options = options_from_body(body);
@@ -606,13 +707,19 @@ pub(crate) async fn stream_chat_completions(
         api_keys.iter().map(|k| Some(k.as_str())).collect()
     };
 
+    // `max_retries = 0` means exactly one request and no retry -- no backoff,
+    // no `Retrying` event. The per-key loop below treats this as the natural
+    // bound and simply never reaches a second attempt.
+    let max_attempts = retry.max_attempts.max(1);
+    let base_backoff = Duration::from_millis(retry.backoff_ms);
+
     let mut spent = Duration::ZERO;
     let mut last_err = String::from("Upstream request failed");
 
     for (key_index, key) in keys.iter().enumerate() {
         let client = client_for(http, &endpoint_base, upstream_url, *key, adapter);
 
-        for attempt in 0..MAX_ATTEMPTS {
+        for attempt in 0..max_attempts {
             let mut progressed = false;
             match run_once(
                 &client,
@@ -624,7 +731,35 @@ pub(crate) async fn stream_chat_completions(
             )
             .await
             {
-                Ok(completion) => return Ok(completion),
+                Ok(completion) => {
+                    // A completion is done even if answerless only once it has
+                    // streamed anything to the consumer -- never replay output.
+                    if progressed {
+                        return Ok(completion);
+                    }
+                    if is_answerless(&completion) {
+                        // Streamed cleanly but carried no text, no reasoning,
+                        // and no tool call. That is the blank turn the user
+                        // would otherwise have to retype: nothing reached the
+                        // consumer, so resending the same request is safe and
+                        // is the only way to recover an answer.
+                        last_err = String::from(
+                            "Upstream completed without producing an answer (empty completion)",
+                        );
+                        wait_before_retry(
+                            events,
+                            attempt,
+                            max_attempts,
+                            base_backoff,
+                            None,
+                            &mut spent,
+                            &last_err,
+                        )
+                        .await?;
+                        continue;
+                    }
+                    return Ok(completion);
+                }
                 Err(err) => {
                     let (status, err_body, headers) = http_parts(&err);
                     let described = describe_error(&err);
@@ -667,26 +802,22 @@ pub(crate) async fn stream_chat_completions(
                             }
                             break;
                         }
-                        Disposition::Retry if attempt + 1 == MAX_ATTEMPTS => {
-                            return Err(format!("{last_err} (after {MAX_ATTEMPTS} attempts)"));
-                        }
                         Disposition::Retry => {
                             // A 429 with more keys available rotates rather than
                             // waiting: another key usually has its own quota.
                             if status == Some(429) && key_index + 1 < keys.len() {
                                 break;
                             }
-                            let delay = next_delay(attempt, headers.and_then(provider_retry_after));
-                            let Some(delay) = budgeted(delay, spent) else {
-                                return Err(format!("{last_err} (retry budget exhausted)"));
-                            };
-                            spent += delay;
-                            log::warn!(
-                                "genai: {last_err} -- retrying in {}ms (attempt {}/{MAX_ATTEMPTS})",
-                                delay.as_millis(),
-                                attempt + 2
-                            );
-                            tokio::time::sleep(delay).await;
+                            wait_before_retry(
+                                events,
+                                attempt,
+                                max_attempts,
+                                base_backoff,
+                                headers.and_then(provider_retry_after),
+                                &mut spent,
+                                &last_err,
+                            )
+                            .await?;
                         }
                     }
                 }
@@ -697,16 +828,77 @@ pub(crate) async fn stream_chat_completions(
     Err(last_err)
 }
 
-/// Exponential backoff for `attempt` (0-based), capped, with a provider-supplied
-/// delay taking precedence when it is longer than what we'd have waited anyway.
-fn next_delay(attempt: u32, provider: Option<Duration>) -> Duration {
-    let backoff = BASE_RETRY_DELAY
+/// Exhaust one attempt: decide the delay, announce it, and wait.
+///
+/// Returns `Err` when no further attempt is allowed -- either the budget is
+/// spent or this was the last attempt -- and that error names the upstream
+/// failure that caused it, so exhaustion is never a silent empty turn.
+///
+/// The announcement goes out *before* the sleep and travels the same
+/// non-blocking channel as tokens, so the TUI can render "retrying 3/10" while
+/// the wait happens off the draw path (see #8710). `attempt` is 0-based.
+async fn wait_before_retry(
+    events: &mpsc::UnboundedSender<StreamEvent>,
+    attempt: u32,
+    max_attempts: u32,
+    base: Duration,
+    provider: Option<Duration>,
+    spent: &mut Duration,
+    last_err: &str,
+) -> Result<(), String> {
+    if attempt + 1 >= max_attempts {
+        return Err(format!("{last_err} (after {max_attempts} attempts)"));
+    }
+    let delay = next_delay(attempt, base, provider);
+    let Some(delay) = budgeted(delay, *spent) else {
+        return Err(format!("{last_err} (retry budget exhausted)"));
+    };
+    *spent += delay;
+    let _ = events.send(StreamEvent::Retrying {
+        attempt: attempt + 1,
+        max: max_attempts,
+        delay_ms: delay.as_millis() as u64,
+        reason: last_err.to_string(),
+    });
+    log::warn!(
+        "genai: {last_err} -- retrying in {}ms (attempt {}/{max_attempts})",
+        delay.as_millis(),
+        attempt + 2
+    );
+    tokio::time::sleep(delay).await;
+    Ok(())
+}
+
+/// Exponential backoff for `attempt` (0-based), starting from `base` and capped
+/// at [`MAX_RETRY_DELAY`], with a provider-supplied delay taking precedence
+/// when it is longer than what we'd have waited anyway.
+fn next_delay(attempt: u32, base: Duration, provider: Option<Duration>) -> Duration {
+    let backoff = base
         .saturating_mul(1u32 << attempt.min(15))
         .min(MAX_RETRY_DELAY);
-    match provider {
-        Some(p) if p > backoff => p,
-        _ => backoff,
+    // A provider that named a delay knows better than we do, and its value is
+    // taken as-is: jittering it could undercut the window it asked for.
+    if let Some(p) = provider {
+        if p > backoff {
+            return p;
+        }
     }
+    jittered(backoff)
+}
+
+/// Spread the delay over [0.5x, 1.0x] of the computed backoff.
+///
+/// Without this, every client that a single upstream outage knocked back
+/// retries in lockstep and re-creates the spike that caused the failure. Full
+/// jitter would risk retrying almost immediately, so the floor stays at half.
+fn jittered(delay: Duration) -> Duration {
+    use rand::Rng;
+    let ms = delay.as_millis() as u64;
+    let floor = ms.div_ceil(2);
+    if floor >= ms {
+        return delay;
+    }
+    Duration::from_millis(rand::thread_rng().gen_range(floor..=ms))
 }
 
 /// Clamp a delay to what remains of [`RETRY_BUDGET`]; `None` when nothing does.
@@ -1130,7 +1322,16 @@ mod tests {
 
     async fn run(url: &str, keys: &[String], events: &mpsc::UnboundedSender<StreamEvent>)
         -> Result<serde_json::Value, String> {
-        stream_chat_completions(&build_http_client(), url, keys, None, &body(), events).await
+        run_with(url, keys, events, RetryConfig::default()).await
+    }
+
+    async fn run_with(
+        url: &str,
+        keys: &[String],
+        events: &mpsc::UnboundedSender<StreamEvent>,
+        retry: RetryConfig,
+    ) -> Result<serde_json::Value, String> {
+        stream_chat_completions(&build_http_client(), url, keys, None, &body(), events, retry).await
     }
 
     #[tokio::test]
@@ -1326,20 +1527,426 @@ mod tests {
         server.await.expect("server");
     }
 
+    // -- Answerless completion: the blank-turn fix.
+
+    /// A 429 then a 200 on the same key retries and succeeds, announcing the
+    /// retry on the way.
+    #[tokio::test]
+    async fn a_rate_limit_then_success_retries_and_signals_the_attempt() {
+        let (url, server) = serve(vec![
+            Some(status_response(429, "Too Many Requests", r#"{"error":"slow"}"#)),
+            Some(sse_response(&[
+                r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ])),
+        ])
+        .await;
+
+        let (tx, mut rx) = sink();
+        let completion = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig {
+                max_attempts: 2,
+                backoff_ms: 10,
+            },
+        )
+        .await
+        .expect("retry carries the turn");
+        assert_eq!(completion["choices"][0]["message"]["content"], "ok");
+
+        drop(tx);
+        let retries: Vec<StreamEvent> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|ev| matches!(ev, StreamEvent::Retrying { .. }))
+            .collect();
+        assert_eq!(retries.len(), 1, "one retry announced");
+        if let StreamEvent::Retrying {
+            attempt,
+            max,
+            reason,
+            ..
+        } = &retries[0]
+        {
+            assert_eq!(*attempt, 1, "1-based attempt that failed");
+            assert_eq!(*max, 2);
+            assert!(reason.contains("429"), "reason names the failure: {reason}");
+        }
+        server.await.expect("server");
+    }
+
+    /// An answerless `stop` completion is retried instead of being returned as
+    /// success, and the second (real) stream wins.
+    #[tokio::test]
+    async fn an_answerless_stop_completion_is_retried() {
+        let (url, server) = serve(vec![
+            Some(sse_response(&[r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#])),
+            Some(sse_response(&[
+                r#"{"choices":[{"delta":{"content":"real answer"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ])),
+        ])
+        .await;
+
+        let (tx, mut rx) = sink();
+        let completion = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig {
+                max_attempts: 2,
+                backoff_ms: 10,
+            },
+        )
+        .await
+        .expect("the second stream wins");
+        assert_eq!(completion["choices"][0]["message"]["content"], "real answer");
+
+        drop(tx);
+        let retried = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|ev| matches!(ev, StreamEvent::Retrying { attempt: 1, .. }));
+        assert!(retried, "the empty attempt announced its retry");
+        server.await.expect("server");
+    }
+
+    /// A turn that streamed content must not be replayed: the server serves
+    /// exactly one request, and no `Retrying` is announced.
+    #[tokio::test]
+    async fn a_turn_that_streamed_content_is_not_replayed() {
+        let (url, server) = serve(vec![Some(sse_response(&[
+            r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]))])
+        .await;
+
+        let (tx, mut rx) = sink();
+        let completion = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig {
+                max_attempts: 5,
+                backoff_ms: 1,
+            },
+        )
+        .await
+        .expect("streamed content returns directly");
+        assert_eq!(completion["choices"][0]["message"]["content"], "hi");
+
+        drop(tx);
+        let retried = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|ev| matches!(ev, StreamEvent::Retrying { .. }));
+        assert!(!retried, "no retry announced for committed output");
+        // Only one reply queued; had a second request been made, the server
+        // would have hung on accept and the client would have timed out.
+        server.await.expect("server");
+    }
+
+    /// A turn that returned tool calls is real output -- never replayed.
+    #[tokio::test]
+    async fn a_turn_with_tool_calls_is_not_replayed() {
+        let (url, server) = serve(vec![Some(sse_response(&[
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"grep","arguments":"{\"q\":\"x\"}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#,
+        ]))])
+        .await;
+
+        let (tx, mut rx) = sink();
+        let completion = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig {
+                max_attempts: 5,
+                backoff_ms: 1,
+            },
+        )
+        .await
+        .expect("tool call returns directly");
+        assert_eq!(completion["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            completion["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "grep"
+        );
+
+        drop(tx);
+        let retried = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|ev| matches!(ev, StreamEvent::Retrying { .. }));
+        assert!(!retried, "no retry announced for a tool-call turn");
+        server.await.expect("server");
+    }
+
+    /// `max_retries = 0` disables retry: exactly one request, no `Retrying`.
+    /// Goes through `from_settings` rather than constructing the budget by
+    /// hand, so the user-facing key is what is under test.
+    #[tokio::test]
+    async fn zero_max_retries_disables_retry() {
+        let (url, server) = serve(vec![Some(status_response(
+            429,
+            "Too Many Requests",
+            r#"{"error":"slow"}"#,
+        ))])
+        .await;
+
+        let (tx, mut rx) = sink();
+        let err = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig::from_settings(Some(0), None),
+        )
+        .await
+        .expect_err("a 429 with retry disabled fails the turn");
+        assert!(err.contains("429"), "the status surfaces: {err}");
+
+        drop(tx);
+        let retried = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|ev| matches!(ev, StreamEvent::Retrying { .. }));
+        assert!(!retried, "no retry announced when retry is disabled");
+        server.await.expect("server");
+    }
+
+    /// `max_retries = 1` buys exactly one resend, not zero. The key counts
+    /// attempts *after* the first, so feeding it straight into the engine's
+    /// attempt budget would silently disable the retry the user asked for.
+    #[tokio::test]
+    async fn one_max_retry_resends_exactly_once() {
+        let (url, server) = serve(vec![
+            Some(status_response(
+                503,
+                "Service Unavailable",
+                r#"{"error":"down"}"#,
+            )),
+            Some(sse_response(&[
+                r#"{"choices":[{"delta":{"content":"recovered"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ])),
+        ])
+        .await;
+
+        let (tx, _rx) = sink();
+        let completion = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig::from_settings(Some(1), Some(1)),
+        )
+        .await
+        .expect("the single allowed retry recovers the turn");
+        assert_eq!(
+            completion["choices"][0]["message"]["content"], "recovered",
+            "the resent request is the one that answers"
+        );
+        server.await.expect("server");
+    }
+
+    /// The absent key and an explicit value resolve distinctly, and the
+    /// unset default matches the documented 10 retries.
+    #[test]
+    fn retry_settings_resolve_absent_and_explicit_distinctly() {
+        assert_eq!(
+            RetryConfig::from_settings(None, None),
+            RetryConfig::default(),
+            "absent keys are the default"
+        );
+        assert_eq!(
+            RetryConfig::from_settings(None, None).max_attempts,
+            DEFAULT_MAX_RETRIES + 1,
+            "10 retries is 11 requests"
+        );
+        assert_eq!(
+            RetryConfig::from_settings(Some(0), None).max_attempts,
+            1,
+            "0 retries is a single request, not the default"
+        );
+        assert_eq!(
+            RetryConfig::from_settings(Some(u32::MAX), None).max_attempts,
+            u32::MAX,
+            "a saturating budget does not wrap to zero attempts"
+        );
+    }
+
+    /// Exhaustion returns an Err naming the last upstream failure, not a blank
+    /// success.
+    #[tokio::test]
+    async fn exhaustion_reports_the_last_failure() {
+        // Two attempts, two failures: the first 500 is retried, the second
+        // (last) 500 exhausts the budget.
+        let (url, server) = serve(vec![
+            Some(status_response(
+                500,
+                "Internal Server Error",
+                r#"{"error":"boom"}"#,
+            )),
+            Some(status_response(
+                500,
+                "Internal Server Error",
+                r#"{"error":"boom"}"#,
+            )),
+        ])
+        .await;
+
+        let (tx, _rx) = sink();
+        let err = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig {
+                max_attempts: 2,
+                backoff_ms: 1,
+            },
+        )
+        .await
+        .expect_err("a persistent 500 exhausts and fails");
+        assert!(err.contains("500"), "the last failure is named: {err}");
+        assert!(
+            err.contains("(after 2 attempts)"),
+            "exhaustion is named with the configured count: {err}"
+        );
+        server.await.expect("server");
+    }
+
+    /// An answerless completion on the FINAL attempt must return an Err naming
+    /// the failure, never `Ok(blank)`.
+    #[tokio::test]
+    async fn an_answerless_final_attempt_fails_not_blanks() {
+        let (url, server) = serve(vec![Some(sse_response(&[
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ]))])
+        .await;
+
+        let (tx, _rx) = sink();
+        let err = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig {
+                max_attempts: 1,
+                backoff_ms: 10,
+            },
+        )
+        .await
+        .expect_err("a blank completion on the only attempt is a failure");
+        assert!(
+            err.contains("empty completion"),
+            "names the blank turn: {err}"
+        );
+        assert!(err.contains("(after 1 attempts)"), "exhaustion named: {err}");
+        server.await.expect("server");
+    }
+
+    /// Classifier coverage across every content shape in the contract.
+    #[test]
+    fn answerless_classifier_covers_every_content_shape() {
+        let blank = |content: Option<serde_json::Value>| {
+            let mut choice = serde_json::Map::new();
+            let mut message = serde_json::Map::new();
+            message.insert("role".into(), json!("assistant"));
+            if let Some(content) = content {
+                message.insert("content".into(), content);
+            }
+            choice.insert("message".into(), serde_json::Value::Object(message));
+            choice.insert("finish_reason".into(), json!("stop"));
+            json!({ "choices": [choice] })
+        };
+
+        // Blank shapes.
+        assert!(is_answerless(&blank(None)), "absent content is blank");
+        assert!(is_answerless(&blank(Some(serde_json::Value::Null))), "null is blank");
+        assert!(is_answerless(&blank(Some(json!("")))), "empty string is blank");
+        assert!(
+            is_answerless(&blank(Some(json!([])))),
+            "empty array is blank"
+        );
+
+        // Not blank shapes.
+        assert!(!is_answerless(&blank(Some(json!("hi")))), "content is an answer");
+        assert!(
+            !is_answerless(&blank(Some(json!("   ")))),
+            "whitespace-only streamed bytes are an answer"
+        );
+        assert!(
+            !is_answerless(&blank(Some(json!([{ "type": "text", "text": "x" }])))),
+            "non-empty array is an answer"
+        );
+        assert!(
+            !is_answerless(&blank(Some(json!([{ "type": "image_url", "image_url": {} }])))),
+            "a non-empty array of any parts is an answer"
+        );
+
+        // length finish_reason is truncation, not a blank turn.
+        let mut length = serde_json::Map::new();
+        let mut msg = serde_json::Map::new();
+        msg.insert("role".into(), json!("assistant"));
+        msg.insert("content".into(), serde_json::Value::Null);
+        length.insert("message".into(), serde_json::Value::Object(msg));
+        length.insert("finish_reason".into(), json!("length"));
+        assert!(!is_answerless(&json!({ "choices": [length] })), "length is not blank");
+
+        // A tool call is an answer regardless of content.
+        let mut tool = serde_json::Map::new();
+        let mut tm = serde_json::Map::new();
+        tm.insert("role".into(), json!("assistant"));
+        tm.insert("content".into(), serde_json::Value::Null);
+        tm.insert(
+            "tool_calls".into(),
+            json!([{ "id": "c1", "type": "function", "function": { "name": "x", "arguments": "{}" } }]),
+        );
+        tool.insert("message".into(), serde_json::Value::Object(tm));
+        tool.insert("finish_reason".into(), json!("tool_calls"));
+        assert!(!is_answerless(&json!({ "choices": [tool] })), "tool call is an answer");
+    }
+
+    /// Backoff doubles per attempt and holds at the ceiling. Jitter makes each
+    /// delay a range rather than a value, so the growth is asserted on the
+    /// bounds: every sample sits in [0.5x, 1.0x] of the nominal backoff.
     #[test]
     fn backoff_grows_then_holds_at_the_ceiling() {
-        assert_eq!(next_delay(0, None), BASE_RETRY_DELAY);
-        assert_eq!(next_delay(1, None), BASE_RETRY_DELAY * 2);
-        assert_eq!(next_delay(20, None), MAX_RETRY_DELAY, "capped, not overflowing");
+        let base = Duration::from_millis(DEFAULT_RETRY_BACKOFF_MS);
+        let in_band = |d: Duration, nominal: Duration| {
+            d <= nominal && d * 2 >= nominal
+        };
+        for _ in 0..64 {
+            assert!(in_band(next_delay(0, base, None), base));
+            assert!(in_band(next_delay(1, base, None), base * 2));
+            assert!(
+                in_band(next_delay(20, base, None), MAX_RETRY_DELAY),
+                "capped, not overflowing"
+            );
+        }
+    }
+
+    /// Lockstep retries are the thing jitter exists to prevent, so the delay
+    /// must actually vary rather than merely sit in range.
+    #[test]
+    fn backoff_is_jittered_rather_than_fixed() {
+        let base = Duration::from_millis(DEFAULT_RETRY_BACKOFF_MS);
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..64 {
+            seen.insert(next_delay(3, base, None));
+        }
+        assert!(
+            seen.len() > 1,
+            "every client would retry in lockstep: {seen:?}"
+        );
     }
 
     #[test]
     fn a_provider_retry_after_wins_only_when_it_is_longer() {
+        let base = Duration::from_millis(DEFAULT_RETRY_BACKOFF_MS);
         let long = Duration::from_secs(30);
-        assert_eq!(next_delay(0, Some(long)), long);
+        assert_eq!(
+            next_delay(0, base, Some(long)),
+            long,
+            "a delay the provider named is honoured exactly, not jittered"
+        );
         // A provider asking for less than our backoff does not get to make us
         // hammer it faster than we would have.
-        assert_eq!(next_delay(5, Some(Duration::from_millis(1))), MAX_RETRY_DELAY);
+        let short = next_delay(5, base, Some(Duration::from_millis(1)));
+        assert!(
+            short <= MAX_RETRY_DELAY && short * 2 >= MAX_RETRY_DELAY,
+            "fell back to our own capped backoff: {short:?}"
+        );
     }
 
     #[test]

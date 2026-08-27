@@ -16,6 +16,19 @@ pub enum StreamEvent {
     /// `<think>` tags in `content` stream those through [`Token`]; consumers
     /// fall back to stripping the tags manually.
     Reasoning { text: String },
+    /// An upstream attempt failed and the completion will be retried after a
+    /// delay. `attempt` is the 1-based number of the attempt that just failed
+    /// (so the next attempt is `attempt + 1`); `max` is the total number of
+    /// attempts allowed for this completion (one plus the configured retry
+    /// budget). `delay_ms` is how long the caller will wait before trying
+    /// again. Display-only: announcing a retry must never block the consumer's
+    /// render loop, so it rides the same non-blocking event channel as tokens.
+    Retrying {
+        attempt: u32,
+        max: u32,
+        delay_ms: u64,
+        reason: String,
+    },
     /// A new orchestration turn began (`index` is 1-based; `max` is the turn
     /// cap, `0` when the run is unbounded, which is the normal case).
     Step { index: u32, max: u32 },
@@ -271,6 +284,27 @@ mod tests {
     fn reasoning_serializes_with_snake_case_tag() {
         let v = serde_json::to_value(StreamEvent::Reasoning { text: "hmm".into() }).unwrap();
         assert_eq!(v, json!({ "type": "reasoning", "text": "hmm" }));
+    }
+
+    #[test]
+    fn retrying_serializes_with_snake_case_tag() {
+        let v = serde_json::to_value(StreamEvent::Retrying {
+            attempt: 2,
+            max: 10,
+            delay_ms: 500,
+            reason: "Upstream returned HTTP 429: slow down".into(),
+        })
+        .unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "type": "retrying",
+                "attempt": 2,
+                "max": 10,
+                "delay_ms": 500,
+                "reason": "Upstream returned HTTP 429: slow down"
+            })
+        );
     }
 
     #[test]

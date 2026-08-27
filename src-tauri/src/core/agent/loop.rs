@@ -84,6 +84,11 @@ pub(crate) struct OrchestrationArgs {
     /// (`[agent].max_parallel_subagents` in agent.toml, default 10). Snapshot
     /// taken at run start: a mid-run config edit affects the *next* run only.
     pub max_parallel_subagents: u32,
+    /// Retry policy for upstream completions (`[agent].max_retries` and
+    /// `[agent].retry_backoff_ms` in agent.toml). Snapshot taken at run start:
+    /// a mid-run config edit affects the *next* run only. `max_retries = 0`
+    /// disables retry entirely.
+    pub retry: crate::core::agent::genai_bridge::RetryConfig,
     /// Auto-allow every tool call that would otherwise prompt (built-in
     /// reads/writes/exec and MCP). The CLI default, since the OS jail in the
     /// tools plugin confines exec regardless; `--safe` turns it off. Desktop
@@ -161,6 +166,7 @@ struct HttpModelInvoker {
     /// Native provider converters still use reqwest 0.12 while the default
     /// agent path uses genai's reqwest 0.13 client.
     converter_client: reqwest::Client,
+    retry: crate::core::agent::genai_bridge::RetryConfig,
 }
 
 fn converter_http_client() -> reqwest::Client {
@@ -206,6 +212,7 @@ impl ModelInvoker for HttpModelInvoker {
                 None,
                 &normalized,
                 events,
+                self.retry,
             )
             .await
         }
@@ -1148,6 +1155,7 @@ pub(crate) async fn run_server_side_openai_orchestration(
         system_prompt_override: None,
         subagents_enabled: false,
         max_parallel_subagents: crate::core::agent::subagent::DEFAULT_MAX_PARALLEL_SUBAGENTS,
+        retry: crate::core::agent::genai_bridge::RetryConfig::default(),
         auto_approve: false,
         run_mode: crate::core::agent::plan::RunMode::Normal,
         session_id: None,
@@ -1393,6 +1401,7 @@ async fn orchestrate_inner(
         run_mode,
         session_id,
         sandbox,
+        ..
     } = args;
 
     // Per-turn override: the TUI toggles plan mode live via the request body
@@ -1677,6 +1686,7 @@ async fn orchestrate_inner(
             .await
             .and_then(|(api_type, oauth)| converter_for(Some(&api_type), oauth)),
         converter_client: converter_http_client(),
+        retry: args.retry,
     };
     let mcp_tools = McpToolInvoker {
         tool_to_server,
@@ -1893,6 +1903,7 @@ pub(crate) async fn compact_history(
             .await
             .and_then(|(api_type, oauth)| converter_for(Some(&api_type), oauth)),
         converter_client: converter_http_client(),
+        retry: args.retry,
     };
     crate::core::agent::compaction::compact_conversation(messages, model_id, &model, keep_recent)
         .await
@@ -1927,6 +1938,7 @@ pub(crate) async fn evaluate_goal(
             .await
             .and_then(|(api_type, oauth)| converter_for(Some(&api_type), oauth)),
         converter_client: converter_http_client(),
+        retry: args.retry,
     };
     crate::core::agent::goal::evaluate(smol_model_id, condition, messages, &model).await
 }
@@ -2019,6 +2031,10 @@ async fn run_turn_cycle(
     let mut mid_run_nudge_count: u32 = 0;
     // One-shot: asked the model to close out its todos before handing back.
     let mut closeout_nudged = false;
+    // One-shot: asked the model to actually answer after it handed back a turn
+    // with nothing in it. Bounded to once per run so a model that insists on
+    // silence ends the run rather than looping.
+    let mut blank_turn_nudged = false;
 
     while unlimited || turn < max_turns {
         let _ = events.send(StreamEvent::Step {
@@ -2122,6 +2138,30 @@ async fn run_turn_cycle(
                 .and_then(|c| c.as_str())
                 .unwrap_or_default()
                 .to_string();
+
+            // The upstream retry engine resends a turn that streamed nothing at
+            // all, but it deliberately will not replay one that already put
+            // reasoning on screen -- replaying would duplicate visible output.
+            // That leaves exactly one way to still reach the user with an empty
+            // turn: the model thought out loud and then said nothing. Ask it
+            // once for the answer instead of handing back a blank turn the user
+            // has to retype. This is a continuation, not a replay: the silent
+            // turn stays in the history and nothing already done is repeated.
+            if final_text.trim().is_empty() && !blank_turn_nudged {
+                blank_turn_nudged = true;
+                log::warn!("agent: model ended a turn with no answer, asking once for one");
+                conversation_messages.push(serde_json::json!({
+                    "role": "assistant",
+                    "content": final_text,
+                }));
+                crate::core::agent::reminder::attach(
+                    &mut conversation_messages,
+                    "That turn ended without an answer. Reply to the user now with what you \
+                     found, or continue the work if it is unfinished.",
+                );
+                turn += 1;
+                continue;
+            }
             let awaiting_user = final_text.trim_end().ends_with('?');
             if !closeout_nudged
                 && run_mode == crate::core::agent::plan::RunMode::Normal
@@ -3165,6 +3205,126 @@ mod tests {
         let (tx, _rx) = mpsc::unbounded_channel();
         let model = MockModel::new(vec![
             json!({ "choices": [{ "message": { "content": "all done" }, "finish_reason": "stop" }] }),
+        ]);
+        let tool = MockTool::default();
+        let mut budget = SessionBudget::new(None);
+        let registry = empty_todo_registry();
+
+        run_turn_cycle(
+            &tx,
+            &json!({}),
+            "m",
+            &[],
+            vec![json!({ "role": "user", "content": "go" })],
+            0,
+            &mut budget,
+            &model,
+            &tool,
+            crate::core::agent::plan::RunMode::Normal,
+            Some(&registry),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(model.requests.lock().unwrap().len(), 1, "no extra turn");
+    }
+
+    /// The blank turn users actually hit: the model streams reasoning and then
+    /// stops with empty content. The upstream retry engine will not resend that
+    /// one -- reasoning already reached the screen, so a replay would duplicate
+    /// it -- which leaves the loop as the only place that can still turn it
+    /// into an answer.
+    #[tokio::test]
+    async fn an_answerless_turn_is_asked_for_an_answer_rather_than_returned_blank() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let model = MockModel::new(vec![
+            json!({ "choices": [{ "message": { "content": "", "reasoning_content": "thinking" }, "finish_reason": "stop" }] }),
+            json!({ "choices": [{ "message": { "content": "here is the answer" }, "finish_reason": "stop" }] }),
+        ]);
+        let tool = MockTool::default();
+        let mut budget = SessionBudget::new(None);
+        let registry = empty_todo_registry();
+
+        let completion = run_turn_cycle(
+            &tx,
+            &json!({}),
+            "m",
+            &[],
+            vec![json!({ "role": "user", "content": "go" })],
+            0,
+            &mut budget,
+            &model,
+            &tool,
+            crate::core::agent::plan::RunMode::Normal,
+            Some(&registry),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            completion["choices"][0]["message"]["content"], "here is the answer",
+            "the user gets an answer, not the blank turn"
+        );
+        let requests = model.requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "one extra turn to ask for the answer");
+        let asked = requests.last().expect("second request")["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .filter(|m| {
+                m["content"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("ended without an answer"))
+            })
+            .count();
+        assert_eq!(asked, 1, "asked exactly once");
+    }
+
+    /// A model that stays silent must end the run, not spin. The ask is
+    /// one-shot: a second blank turn is returned as-is.
+    #[tokio::test]
+    async fn a_persistently_blank_model_ends_the_run_instead_of_looping() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let blank =
+            json!({ "choices": [{ "message": { "content": "" }, "finish_reason": "stop" }] });
+        let model = MockModel::new(vec![blank.clone(), blank.clone(), blank]);
+        let tool = MockTool::default();
+        let mut budget = SessionBudget::new(None);
+        let registry = empty_todo_registry();
+
+        run_turn_cycle(
+            &tx,
+            &json!({}),
+            "m",
+            &[],
+            vec![json!({ "role": "user", "content": "go" })],
+            0,
+            &mut budget,
+            &model,
+            &tool,
+            crate::core::agent::plan::RunMode::Normal,
+            Some(&registry),
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            model.requests.lock().unwrap().len(),
+            2,
+            "asked once, then accepted the silence"
+        );
+    }
+
+    /// A real answer must not trip the backstop, and whitespace counts as real
+    /// output: those bytes streamed to the user.
+    #[tokio::test]
+    async fn a_turn_with_content_is_never_nudged() {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let model = MockModel::new(vec![
+            json!({ "choices": [{ "message": { "content": "done" }, "finish_reason": "stop" }] }),
         ]);
         let tool = MockTool::default();
         let mut budget = SessionBudget::new(None);

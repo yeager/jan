@@ -1863,6 +1863,7 @@ mod tests {
             system_prompt_override: None,
             subagents_enabled: true,
             max_parallel_subagents: 1,
+            retry: crate::core::agent::genai_bridge::RetryConfig::default(),
             auto_approve: false,
             run_mode: crate::core::agent::plan::RunMode::Normal,
             session_id: None,

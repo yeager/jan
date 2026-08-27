@@ -104,6 +104,16 @@ pub(crate) struct AgentSection {
     /// run only.
     #[serde(default)]
     pub max_parallel_subagents: Option<u32>,
+    /// Retries for one upstream completion: after an empty (answerless) turn or
+    /// a transient failure, retry up to this many times. Default 10 (plus the
+    /// first request, up to 11 requests). `0` disables retry: exactly one
+    /// request. Snapshot at run start.
+    #[serde(default)]
+    pub max_retries: Option<u32>,
+    /// First backoff before a retry, in milliseconds; doubles per attempt up to
+    /// an 8s ceiling. Default 250. Snapshot at run start.
+    #[serde(default)]
+    pub retry_backoff_ms: Option<u64>,
     /// Expand `<think>` reasoning blocks in the TUI transcript instead of
     /// folding them to a `[thinking]`/`[thought for Ns]` status and a summary
     /// row. Default false (hidden); Ctrl-O still reveals a folded block, and
@@ -164,6 +174,8 @@ const AGENT_TOML_TEMPLATE: &str = r#"[agent]
 # compaction_reserve_tokens = 16384  # headroom before auto-compaction; defaults to 16K
 # max_tokens = 4096  # cap on tokens the model generates per response (OpenAI max_tokens); omitted if unset
 # max_parallel_subagents = 10  # max concurrently-running subagents per run; extra dispatches queue FIFO
+# max_retries = 10  # retries per upstream completion (0 disables retry); empty turns are retried too
+# retry_backoff_ms = 250  # first backoff before a retry, doubles per attempt up to 8s
 # show_reasoning = false  # expand  reasoning in the transcript (Ctrl-O still toggles)
 # send_reasoning = true  # resend prior reasoning to the model; false drops it from the request
 #                        # (a provider that rejects the field is detected and stripped automatically)
@@ -593,6 +605,26 @@ mod tests {
         set_agent_key(&path, "max_parallel_subagents", None).expect("unset");
         let cfg = load_agent_config(&root).expect("load");
         assert_eq!(cfg.agent.max_parallel_subagents, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[cfg(feature = "cli")]
+    #[test]
+    fn retry_fields_parse_and_default_to_absent() {
+        let root = unique_root("max_retries");
+        ensure_project(&root).expect("scaffold");
+        let cfg = load_agent_config(&root).expect("load");
+        assert_eq!(cfg.agent.max_retries, None, "template leaves it unset");
+        assert_eq!(cfg.agent.retry_backoff_ms, None);
+
+        // Explicit values round-trip; `0` is a real value distinct from absent.
+        let path = agent_toml_path(&root);
+        set_agent_key(&path, "max_retries", Some(toml_edit::value(0i64))).expect("write");
+        set_agent_key(&path, "retry_backoff_ms", Some(toml_edit::value(500i64)))
+            .expect("write");
+        let cfg = load_agent_config(&root).expect("load");
+        assert_eq!(cfg.agent.max_retries, Some(0), "zero is preserved, not treated as absent");
+        assert_eq!(cfg.agent.retry_backoff_ms, Some(500));
         let _ = std::fs::remove_dir_all(&root);
     }
 

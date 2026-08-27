@@ -690,6 +690,7 @@ fn build_cli_orchestration_args(
     auto_approve: bool,
     plan: bool,
     max_parallel_subagents: u32,
+    retry: crate::core::agent::genai_bridge::RetryConfig,
     sandbox: Option<bool>,
 ) -> OrchestrationArgs {
     OrchestrationArgs {
@@ -706,6 +707,7 @@ fn build_cli_orchestration_args(
         system_prompt_override: None,
         subagents_enabled: true,
         max_parallel_subagents,
+        retry,
         auto_approve,
         run_mode: if plan {
             crate::core::agent::plan::RunMode::Plan
@@ -958,6 +960,10 @@ fn prepare_agent_session(
         .agent
         .max_parallel_subagents
         .unwrap_or(crate::core::agent::subagent::DEFAULT_MAX_PARALLEL_SUBAGENTS);
+    let retry = crate::core::agent::genai_bridge::RetryConfig::from_settings(
+        cfg.agent.max_retries,
+        cfg.agent.retry_backoff_ms,
+    );
     let args = build_cli_orchestration_args(
         project_root,
         permissions,
@@ -968,6 +974,7 @@ fn prepare_agent_session(
         flags.auto_approve,
         flags.plan,
         max_parallel_subagents,
+        retry,
         flags.sandbox,
     );
 
@@ -1358,6 +1365,16 @@ async fn print_event(ev: StreamEvent, registry: &PermissionRegistry) {
         // Headless prints one line per completed call; the in-progress signal
         // and its argument deltas have nothing to render into.
         StreamEvent::ToolCallStarted { .. } | StreamEvent::ToolCallArgsDelta { .. } => {}
+        StreamEvent::Retrying {
+            attempt,
+            max,
+            delay_ms,
+            reason,
+        } => {
+            eprintln!(
+                "\x1b[2m[retrying {attempt}/{max} in {delay_ms}ms: {reason}]\x1b[0m"
+            );
+        }
         // Headless reports totals once, from the terminal `Done`.
         StreamEvent::TurnUsage { .. } => {}
         StreamEvent::ToolCall { name, args, .. } => eprintln!(

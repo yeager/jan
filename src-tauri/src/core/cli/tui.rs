@@ -4476,6 +4476,20 @@ impl App {
                     self.tokens = prompt + usage.completion_tokens.unwrap_or(0);
                 }
             }
+            StreamEvent::Retrying {
+                attempt,
+                max,
+                delay_ms,
+                reason,
+            } => {
+                // Announce the retry as a fresh row rather than letting it
+                // interleave mid-row with buffered assistant/reasoning output.
+                self.flush_assistant();
+                self.note(&format!(
+                    "retrying {attempt}/{max} in {delay_ms}ms: {}",
+                    truncate(&reason, 120)
+                ));
+            }
             StreamEvent::Done { .. } | StreamEvent::Error { .. } => {}
             StreamEvent::MessagesUpdated { messages } => {
                 self.history = messages;
@@ -20260,6 +20274,7 @@ mod tests {
                 system_prompt_override: None,
                 subagents_enabled: true,
                 max_parallel_subagents: 4,
+                retry: crate::core::agent::genai_bridge::RetryConfig::default(),
                 auto_approve: false,
                 run_mode: crate::core::agent::plan::RunMode::Normal,
                 session_id: None,

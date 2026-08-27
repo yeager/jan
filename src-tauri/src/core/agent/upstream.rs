@@ -1022,6 +1022,7 @@ pub(crate) async fn stream_openai_chat_completions(
     api_type: Option<&str>,
     body: &serde_json::Value,
     events: &mpsc::UnboundedSender<StreamEvent>,
+    retry: super::genai_bridge::RetryConfig,
 ) -> Result<serde_json::Value, String> {
     super::genai_bridge::stream_chat_completions(
         client,
@@ -1030,6 +1031,7 @@ pub(crate) async fn stream_openai_chat_completions(
         api_type,
         body,
         events,
+        retry,
     )
     .await
 }
@@ -1690,6 +1692,7 @@ mod tests {
             None,
             &json!({ "model": "m", "messages": [] }),
             &tx,
+            crate::core::agent::genai_bridge::RetryConfig::default(),
         )
         .await
         .expect("the retry carries the turn");
