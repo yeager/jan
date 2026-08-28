@@ -3536,6 +3536,10 @@ mod tests {
 
     /// Renders for real when a browser is present, and returns an image part
     /// rather than a data URL buried in the text.
+    // The guard must span the await: it serialises the shared Chrome binary
+    // against the other screenshot tests, which is exactly what the lint warns
+    // about and exactly what this test needs.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn screenshot_returns_an_image_part_when_chrome_is_present() {
         if chrome_binary().is_none() {

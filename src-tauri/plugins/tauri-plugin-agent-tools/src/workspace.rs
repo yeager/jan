@@ -543,6 +543,9 @@ mod tests {
     /// remove it and no `keep` list to rebuild, so the startup sweep collects it
     /// by age. Nothing else in the temp dir is touched, and a fresh scratch
     /// survives the real 24h threshold.
+    // The guard must span the awaits: it serialises this test against the other
+    // scratch tests sharing the temp dir, which is the point of taking it.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn stale_scratch_dirs_are_swept_and_fresh_ones_are_not() {
         let session = format!("sweep-stale-{}", std::process::id());

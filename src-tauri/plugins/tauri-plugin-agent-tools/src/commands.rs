@@ -354,6 +354,10 @@ impl WorkspaceScope {
 // `read_only_project` is a folder the user attached read-only. It is validated
 // here rather than trusted: an unusable one is an error, never a silent drop,
 // or the agent would work against a folder it believes is attached and is not.
+// Each parameter is a distinct field the frontend sends by name over IPC, so
+// grouping them into a struct would change the command's wire contract rather
+// than simplify anything.
+#[allow(clippy::too_many_arguments)]
 pub async fn execute_tool(
     data_folder: String,
     thread_id: String,
@@ -759,6 +763,9 @@ mod tests {
     /// files. The session scratch is the exception: it is the agent's own area,
     /// spelled `/tmp/...` where it is bound over the sandbox's `/tmp` and by its
     /// real path where nothing is mounted there.
+    // The guard must span the awaits: it keeps the sweep test from collecting
+    // this test's scratch between the write and the assertion.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn escaping_writes_are_refused() {
         let data = unique_data_folder();
@@ -1442,12 +1449,16 @@ mod tests {
     }
     // ---- live output streaming ---------------------------------------------
 
+    /// What the test sink records per chunk: sequence number, the call it
+    /// belongs to, and the text. Shared by the sink and both tests that read it.
+    type SeenChunks = std::sync::Arc<std::sync::Mutex<Vec<(u64, Option<String>, String)>>>;
+
     /// The sink builder is exercised directly: a real `Channel` needs a webview,
     /// and what matters here is the ordering, correlation and the byte budget.
     #[test]
     fn the_output_sink_numbers_chunks_and_tags_them_with_the_call() {
         use std::sync::{Arc, Mutex};
-        let seen: Arc<Mutex<Vec<(u64, Option<String>, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: SeenChunks = Arc::new(Mutex::new(Vec::new()));
         let sink = test_sink(seen.clone(), Some("call-7".into()));
 
         sink("one".into());
@@ -1467,7 +1478,7 @@ mod tests {
     #[test]
     fn the_output_sink_stops_at_the_byte_cap_and_says_so() {
         use std::sync::{Arc, Mutex};
-        let seen: Arc<Mutex<Vec<(u64, Option<String>, String)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: SeenChunks = Arc::new(Mutex::new(Vec::new()));
         let sink = test_sink(seen.clone(), None);
 
         sink("x".repeat(MAX_STREAMED_BYTES + 1));
@@ -1482,7 +1493,7 @@ mod tests {
     /// Mirrors `output_sink`'s accounting without a `Channel`, which cannot be
     /// constructed outside a webview.
     fn test_sink(
-        seen: std::sync::Arc<std::sync::Mutex<Vec<(u64, Option<String>, String)>>>,
+        seen: SeenChunks,
         call_id: Option<String>,
     ) -> crate::tools::OutputSink {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
