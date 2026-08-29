@@ -3541,7 +3541,6 @@ mod tests {
     // about and exactly what this test needs.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn screenshot_returns_an_image_part_when_chrome_is_present() {
         if chrome_binary().is_none() {
             return;

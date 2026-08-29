@@ -771,7 +771,6 @@ mod tests {
     // this test's scratch between the write and the assertion.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn escaping_writes_are_refused() {
         let data = unique_data_folder();
         let df = data.to_string_lossy().to_string();

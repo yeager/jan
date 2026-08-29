@@ -547,7 +547,6 @@ mod tests {
     // scratch tests sharing the temp dir, which is the point of taking it.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn stale_scratch_dirs_are_swept_and_fresh_ones_are_not() {
         let session = format!("sweep-stale-{}", std::process::id());
         let _guard = lock_scratch_namespace();
