@@ -562,8 +562,26 @@ fn http_parts(err: &genai::Error) -> (Option<u16>, Option<&str>, Option<&reqwest
             } => (Some(status.as_u16()), Some(body.as_str()), Some(headers)),
             other => (other.status().map(|s| s.as_u16()), None, None),
         },
+        // A provider can return 200 and then fail inside the SSE stream: genai
+        // turns an event carrying an "error" object into `ChatResponse`, which
+        // carries the body but no status. The object's `code` field is the HTTP
+        // status the provider meant -- without it a deterministic 400 is
+        // indistinguishable from a dropped connection and burns the whole
+        // retry budget on an error that cannot succeed.
+        genai::Error::ChatResponse { body, .. } => (stream_event_status(body), None, None),
         _ => (err.status().map(|s| s.as_u16()), None, None),
     }
+}
+
+/// The status a provider embedded in an in-stream error object. OpenAI's own
+/// API sends a string there ("invalid_api_key"), so only a number or a numeric
+/// string counts; anything else stays unclassified (retryable) rather than
+/// guessing.
+fn stream_event_status(body: &serde_json::Value) -> Option<u16> {
+    let code = body.get("code")?;
+    code.as_u64()
+        .and_then(|c| u16::try_from(c).ok())
+        .or_else(|| code.as_str().and_then(|s| s.parse().ok()))
 }
 
 /// Every message in an error's `source()` chain, outermost cause first, with
@@ -1546,6 +1564,61 @@ mod tests {
         let (tx, _rx) = sink();
         let err = run(&url, &[], &tx).await.expect_err("400 is fatal");
         assert!(err.contains("400"), "status surfaces to the caller: {err}");
+        server.await.expect("server");
+    }
+
+    /// A provider can answer 200 and then fail inside the SSE stream: the
+    /// event's "error" object carries a `code` but no HTTP status. That code
+    /// must be classified like a status -- a 4xx there is deterministic and
+    /// fails the turn instead of burning the whole retry budget (17s of
+    /// fruitless backoff in the reported case).
+    #[tokio::test]
+    async fn a_4xx_stream_error_event_is_not_retried() {
+        let (url, server) = serve(vec![Some(sse_response(&[
+            r#"{"error":{"message":"Unable to complete the request. Please try again.","type":"upstream_error","code":400}}"#,
+        ]))])
+        .await;
+
+        let (tx, _rx) = sink();
+        let err = run_with(&url, &[], &tx, RetryConfig { max_attempts: 2, backoff_ms: 10 })
+            .await
+            .expect_err("a 400 stream event is fatal");
+        assert!(
+            err.contains("400"),
+            "the event's code is classified like a status, so the error names it and no retry masked it: {err}"
+        );
+        server.await.expect("server");
+    }
+
+    /// The mirror image: a 5xx delivered the same way is transient and is
+    /// still retried. Guards against classifying every in-stream error as
+    /// fatal to kill the 400 problem.
+    #[tokio::test]
+    async fn a_5xx_stream_error_event_is_retried() {
+        let (url, server) = serve(vec![
+            Some(sse_response(&[
+                r#"{"error":{"message":"upstream recycled","type":"upstream_error","code":502}}"#,
+            ])),
+            Some(sse_response(&[
+                r#"{"choices":[{"delta":{"content":"ok"}}]}"#,
+                r#"{"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+            ])),
+        ])
+        .await;
+
+        let (tx, _rx) = sink();
+        let completion = run_with(
+            &url,
+            &[],
+            &tx,
+            RetryConfig {
+                max_attempts: 2,
+                backoff_ms: 10,
+            },
+        )
+        .await
+        .expect("the 502 event is transient, the retry carries the turn");
+        assert_eq!(completion["choices"][0]["message"]["content"], "ok");
         server.await.expect("server");
     }
 
