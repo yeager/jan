@@ -595,6 +595,10 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// The output sink test's shared ledger: what was sent, tagged with call id.
+    type Seen = Arc<Mutex<Vec<(u64, Option<String>, String)>>>;
 
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
 
@@ -767,6 +771,7 @@ mod tests {
     // this test's scratch between the write and the assertion.
     #[allow(clippy::await_holding_lock)]
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn escaping_writes_are_refused() {
         let data = unique_data_folder();
         let df = data.to_string_lossy().to_string();
@@ -1449,16 +1454,11 @@ mod tests {
     }
     // ---- live output streaming ---------------------------------------------
 
-    /// What the test sink records per chunk: sequence number, the call it
-    /// belongs to, and the text. Shared by the sink and both tests that read it.
-    type SeenChunks = std::sync::Arc<std::sync::Mutex<Vec<(u64, Option<String>, String)>>>;
-
     /// The sink builder is exercised directly: a real `Channel` needs a webview,
     /// and what matters here is the ordering, correlation and the byte budget.
     #[test]
     fn the_output_sink_numbers_chunks_and_tags_them_with_the_call() {
-        use std::sync::{Arc, Mutex};
-        let seen: SeenChunks = Arc::new(Mutex::new(Vec::new()));
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let sink = test_sink(seen.clone(), Some("call-7".into()));
 
         sink("one".into());
@@ -1477,8 +1477,7 @@ mod tests {
     /// tool result.
     #[test]
     fn the_output_sink_stops_at_the_byte_cap_and_says_so() {
-        use std::sync::{Arc, Mutex};
-        let seen: SeenChunks = Arc::new(Mutex::new(Vec::new()));
+        let seen: Seen = Arc::new(Mutex::new(Vec::new()));
         let sink = test_sink(seen.clone(), None);
 
         sink("x".repeat(MAX_STREAMED_BYTES + 1));
@@ -1492,10 +1491,7 @@ mod tests {
 
     /// Mirrors `output_sink`'s accounting without a `Channel`, which cannot be
     /// constructed outside a webview.
-    fn test_sink(
-        seen: SeenChunks,
-        call_id: Option<String>,
-    ) -> crate::tools::OutputSink {
+    fn test_sink(seen: Seen, call_id: Option<String>) -> crate::tools::OutputSink {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
         use std::sync::Arc;
         let seq = Arc::new(AtomicU64::new(0));
