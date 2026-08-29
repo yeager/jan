@@ -118,7 +118,8 @@ retrying 3/11 in 500ms: Upstream returned HTTP 429: rate limited
 A turn is only resent when nothing has been committed yet - no text on screen, no tool call run.
 Once output has appeared or a tool has executed, resending would duplicate work that already
 happened, so the error stands instead. When the attempts run out, the run fails naming the last
-upstream failure; it never ends quietly with an empty answer.
+upstream failure. The one nudge for a reasoning-only turn is exactly that - a nudge; if the model
+answers blank a second time, the blank turn is returned as-is.
 
 One case cannot be resent: a model that streams its reasoning and then stops without an answer. The
 thinking is already on screen, so instead of replaying it the console asks once for the answer.

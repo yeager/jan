@@ -102,7 +102,7 @@ inject = "always"
 | `max_tokens` | unset | Cap on tokens generated per response. Omitted from the request when unset |
 | `max_parallel_subagents` | `10` | Subagents that may run at once (min 1); extra dispatches queue FIFO |
 | `max_retries` | `10` | Attempts to resend a failed upstream call, counted *after* the first failure. Covers a dropped or refused connection, a request timeout, HTTP 408/409/425/429 and any 5xx, and a turn that came back with no answer at all. Set `0` to disable retrying - a real setting, distinct from leaving the key unset |
-| `retry_backoff_ms` | `250` | Base delay before the first retry. Doubles per attempt, capped at 8s, then jittered down into [0.5x, 1.0x] so many clients do not retry one provider in lockstep. A `Retry-After` header from the upstream replaces the computed delay |
+| `retry_backoff_ms` | `250` | Base delay before the first retry. Doubles per attempt, capped at 8s, then jittered down into [0.5x, 1.0x] so many clients do not retry one provider in lockstep. A `Retry-After` header from the upstream wins only when it is longer than the computed delay, and is taken as-is (not jittered, not capped) |
 | `show_reasoning` | `false` | Unfold model reasoning (`<thinking>`) blocks in the transcript instead of folding them to a summary row. <kbd>Ctrl</kbd>+<kbd>O</kbd> still toggles a folded block |
 | `send_reasoning` | `true` | Resend a prior turn's reasoning to the model with the conversation. Set `false` for an upstream that rejects the field (e.g. Groq), or to keep chains of thought out of the context budget |
 | `instructions_file` | `AGENT.md` | Markdown injected into the system prompt |
