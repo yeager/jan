@@ -2134,7 +2134,8 @@ async fn run_turn_cycle(
             // "forgot to mark done" case, not to argue with the model.
             // Skip when the model appears to be asking the user something --
             // nudging there would talk over its own question.
-            let final_text = extract_choice_message(&completion)
+            let choice_message = extract_choice_message(&completion);
+            let final_text = choice_message
                 .and_then(|m| m.get("content"))
                 .and_then(|c| c.as_str())
                 .unwrap_or_default()
@@ -2151,10 +2152,23 @@ async fn run_turn_cycle(
             if final_text.trim().is_empty() && !blank_turn_nudged {
                 blank_turn_nudged = true;
                 log::warn!("agent: model ended a turn with no answer, asking once for one");
-                conversation_messages.push(serde_json::json!({
+                // Match the tool-call history shape: `null` content, not an
+                // empty string -- some strict providers reject the empty
+                // string with a 400, which the retry engine rightly refuses
+                // to replay. The reasoning is carried too, so the
+                // continuation request keeps the chain of thought.
+                let mut nudged = serde_json::json!({
                     "role": "assistant",
-                    "content": final_text,
-                }));
+                    "content": serde_json::Value::Null,
+                });
+                if let Some(r) = choice_message
+                    .and_then(|m| m.get("reasoning_content"))
+                    .and_then(|v| v.as_str())
+                    .filter(|r| !r.is_empty())
+                {
+                    nudged["reasoning_content"] = serde_json::json!(r);
+                }
+                conversation_messages.push(nudged);
                 crate::core::agent::reminder::attach(
                     &mut conversation_messages,
                     "That turn ended without an answer. Reply to the user now with what you \
@@ -3281,6 +3295,22 @@ mod tests {
             })
             .count();
         assert_eq!(asked, 1, "asked exactly once");
+
+        // The nudge keeps the silent turn in the history in the same shape the
+        // tool-call path uses: `null` content (an empty string is rejected by
+        // some strict providers with a 400) with the reasoning attached, so
+        // the continuation keeps the chain of thought.
+        let nudged = requests.last().expect("second request")["messages"]
+            .as_array()
+            .expect("messages")
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("the silent turn is in the history");
+        assert!(
+            nudged["content"].is_null(),
+            "null content, not an empty string: {nudged}"
+        );
+        assert_eq!(nudged["reasoning_content"], "thinking");
     }
 
     /// A model that stays silent must end the run, not spin. The ask is
